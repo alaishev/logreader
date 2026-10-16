@@ -3,7 +3,9 @@
 #include "filter.h"
 #include "log_reader.h"
 
-#include <unistd.h>
+#ifndef _WIN32
+#include <unistd.h>  // geteuid()
+#endif
 
 #include <gtest/gtest.h>
 #include <cstdint>
@@ -60,7 +62,7 @@ protected:
     {
         const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
         dir = fs::temp_directory_path()
-            / (std::string("logreader_test_") + info->name() + "_" + std::to_string(::getpid()));
+            / (std::string("logreader_test_") + info->name() + "_" + std::to_string(std::random_device{}()));
         fs::remove_all(dir);
         ASSERT_TRUE(fs::create_directories(dir));
     }
@@ -139,9 +141,13 @@ TEST_F(LogReaderOpenTest, OpenInvalidPathsFails)
 
 TEST_F(LogReaderOpenTest, OpenWithoutPermissionsFails)
 {
+#ifdef _WIN32
+    GTEST_SKIP() << "Windows rights are ACLs: fs::permissions() sets only the read-only attribute";
+#else
     if (::geteuid() == 0) {
         GTEST_SKIP() << "root ignores file permissions";
     }
+#endif
     const fs::path noRead = makeFile("noread.txt");
     fs::permissions(noRead, fs::perms::none);
 
@@ -175,15 +181,21 @@ TEST_F(LogReaderOpenTest, OpenCloseSequences)
     EXPECT_FALSE(reader.open(missing));  // open after failed open
     EXPECT_TRUE(reader.open(a.string()));
 
-    // The opened file may be removed from the file system while the reader holds it
-    fs::remove(a);
+    // The opened file may be removed from the file system while the reader holds it (POSIX).
+    // Windows does not remove an open file, there it is removed after close()
+    std::error_code ec;
+    fs::remove(a, ec);
     reader.close();
+    fs::remove(a, ec);
     EXPECT_FALSE(reader.open(a.string()));
 }
 
 // The file descriptor is released by close(), by the next open() (successful or not) and by the destructor
 TEST_F(LogReaderOpenTest, FileIsReleased)
 {
+#ifndef __linux__
+    GTEST_SKIP() << "open descriptors are listed via /proc/self/fd, Linux only";
+#endif
     const fs::path a = makeFile("a.txt");
     const fs::path b = makeFile("b.txt");
 

@@ -2,7 +2,6 @@
 #include "filter.h"
 
 #include <algorithm>
-#include <limits>
 #include <optional>
 
 namespace {
@@ -125,6 +124,7 @@ FilterAtom Filter::makeLiteral(char ch) const
     FilterAtom atom;
     atom.type = AtomType::LITERAL;
     atom.set.set(c);
+    atom.ch = ch;
 
     if (const auto symbol = makeChar(c); ignoreCase && symbol) {
         atom.type = AtomType::CHAR_CLASS;
@@ -140,6 +140,7 @@ bool Filter::parse(std::string_view filter)
 {
     valid = false;
     length = 0;
+    lastStar = NO_STAR;
     literalLength = 0;
 
     if (filter.empty() || (filter.size() >= MAX_FILTER_LENGTH)) {
@@ -191,7 +192,7 @@ bool Filter::parse(std::string_view filter)
             if ((dst > 0) && (atoms[dst - 1].type == AtomType::ANY_SEQUENCE)) {
                 continue;
             }
-            atoms[dst++] = FilterAtom{AtomType::ANY_SEQUENCE, CharSet{}};
+            atoms[dst++] = FilterAtom{.type = AtomType::ANY_SEQUENCE, .set = CharSet{}};
             continue;
         }
 
@@ -202,7 +203,7 @@ bool Filter::parse(std::string_view filter)
             if (!set) {
                 return false;
             }
-            atoms[dst++] = FilterAtom{AtomType::CHAR_CLASS, *set};
+            atoms[dst++] = FilterAtom{.type = AtomType::CHAR_CLASS, .set = *set};
             src = pos;  // pos is at ']', ++src of the loop moves past it
             continue;
         }
@@ -210,7 +211,7 @@ bool Filter::parse(std::string_view filter)
         // '?' accepts any byte: all 256 bits are set
         if (ch == '?') {
             endRun();
-            atoms[dst++] = FilterAtom{AtomType::ANY_CHAR, CharSet{}.set()};
+            atoms[dst++] = FilterAtom{.type = AtomType::ANY_CHAR, .set = CharSet{}.set()};
             continue;
         }
 
@@ -220,6 +221,12 @@ bool Filter::parse(std::string_view filter)
 
     length = dst;
     valid = true;
+
+    for (std::size_t i = 0; i < length; ++i) {
+        if (atoms[i].type == AtomType::ANY_SEQUENCE) {
+            lastStar = i;
+        }
+    }
 
     return true;
 }
@@ -246,29 +253,70 @@ bool Filter::isValid() const
 // Example: mask "a*x", line "abcx". '*' takes "", "b", "bc" in turn; with "bc" the 'x' matches.
 bool Filter::matchesFilter(std::string_view line)
 {
-    constexpr std::size_t NO_STAR = std::numeric_limits<std::size_t>::max();
+    // No '*': one character per atom, so the length is known
+    if (lastStar == NO_STAR) {
+        return (line.size() == length) && matchesFixed(line, 0);
+    }
+
+    // The atoms after the last '*' take the last characters of the line: they are checked at once,
+    // and the rest of the mask (it ends with that '*') is matched against the rest of the line.
+    // Example: mask "*INFO*x", line "...INFO...xxx": 'x' is checked against the last character only,
+    // instead of trying every 'x' of the line as the end of the match.
+    const std::size_t tail = length - lastStar - 1;
+    if (line.size() < tail) {
+        return false;
+    }
+    if (!matchesFixed(line.substr(line.size() - tail), lastStar + 1)) {
+        return false;
+    }
+    line.remove_suffix(tail);
+    const std::size_t end = lastStar + 1;  // atoms of the rest of the mask: [0, end), the last one is '*'
 
     std::size_t p = 0;            // index of the current atom
     std::size_t t = 0;            // index of the current character of the line
     std::size_t starP = NO_STAR;  // index of the atom of the last '*' met, NO_STAR if there was none yet
     std::size_t starT = 0;        // first character of the line after the part taken by the last '*'
+    bool jump = false;            // the atom after the last '*' is an ordinary character: find it with memchr
 
     while (t < line.size()) {
         // The atom accepts the character: go to the next atom and the next character
-        if ((p < length) && (atoms[p].type != AtomType::ANY_SEQUENCE) && atoms[p].matchesChar(line[t])) {
+        if ((p < end) && (atoms[p].type != AtomType::ANY_SEQUENCE) && atoms[p].matchesChar(line[t])) {
             ++p;
             ++t;
         }
         // The atom is '*': remember where it is, first it takes no characters
-        else if ((p < length) && (atoms[p].type == AtomType::ANY_SEQUENCE)) {
+        else if ((p < end) && (atoms[p].type == AtomType::ANY_SEQUENCE)) {
             starP = p;
             starT = t;
             ++p;
+            // The last atom is '*': it takes the rest of the line, whatever it is
+            if (p == end) {
+                return true;
+            }
+            // The next atom is an ordinary character: '*' takes everything up to its next occurrence,
+            // so jump there with memchr (string_view::find) instead of moving by one character
+            jump = (atoms[p].type == AtomType::LITERAL);
+            if (jump) {
+                t = line.find(atoms[p].ch, t);
+                if (t == std::string_view::npos) {
+                    return false;  // an earlier '*' can not help: it would only move the atoms further right
+                }
+                starT = t;
+            }
         }
         // Mismatch, but there was a '*': it takes one more character, the atoms after it are checked again
         else if (starP != NO_STAR) {
             p = starP + 1;
-            t = ++starT;
+            if (jump) {
+                t = line.find(atoms[p].ch, starT + 1);
+                if (t == std::string_view::npos) {
+                    return false;
+                }
+                starT = t;
+            }
+            else {
+                t = ++starT;
+            }
         }
         // Mismatch and no '*' before: the line does not match
         else {
@@ -278,9 +326,20 @@ bool Filter::matchesFilter(std::string_view line)
 
     // The line is over. The rest of the mask matches only if it is just '*' (they may take nothing):
     // e.g. mask "abc*" and line "abc".
-    while ((p < length) && (atoms[p].type == AtomType::ANY_SEQUENCE)) {
+    while ((p < end) && (atoms[p].type == AtomType::ANY_SEQUENCE)) {
         ++p;
     }
 
-    return p == length;
+    return p == end;
+}
+
+// Checks text against the atoms from first on, one character per atom: no '*' among them
+bool Filter::matchesFixed(std::string_view text, std::size_t first) const
+{
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (!atoms[first + i].matchesChar(text[i])) {
+            return false;
+        }
+    }
+    return true;
 }

@@ -41,12 +41,12 @@ public:
                      std::size_t bufsize) noexcept;  // request of every matched line, false - end of file or error
 
 private:
-    bool readBlock();                               // append next portion of the file to the block
-    std::optional<std::string_view> nextRawLine();  // next line of the file, without filtering
-    bool dropTruncatedRest();                       // skip the rest of a long line up to '\n'
+    bool readBlock();                                 // append next portion of the file to the block
+    std::optional<std::string_view> nextLine();       // next line of the file, without filtering
+    bool dropTruncatedRest();                         // skip the rest of a long line up to '\n'
     void skipLinesWithout(std::string_view literal);  // prefilter: skip complete lines without the literal
-    void resetPosition();                           // drop block content and EOF state
-    std::string_view pending() const;               // unprocessed data of the block: [dataBegin, dataEnd)
+    void resetPosition();                             // drop block content and EOF state
+    std::string_view pending() const;                 // unprocessed data of the block: [dataBegin, dataEnd)
 
     const std::size_t blockSize;
     std::ifstream logFile;
@@ -55,6 +55,7 @@ private:
     // Position of unprocessed data in blockBuf
     std::size_t dataBegin = 0;
     std::size_t dataEnd = 0;
+    std::size_t lastNl = std::string_view::npos;  // last '\n' of the read data, from the start of blockBuf
 
     bool eof = false;
     bool truncatedLine = false;  // current line is longer than the block, its rest will be dropped

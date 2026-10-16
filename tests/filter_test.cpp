@@ -3,6 +3,7 @@
 #include "filter.h"
 
 #include <gtest/gtest.h>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,6 +78,33 @@ TEST(FilterMatch, Anchoring)
       {"abc*", {"abc", "abcd", "abc abc"}, {"", "ab", "xabc"}},
       {"*abc", {"abc", "xabc", "abcabc"}, {"", "abcd", "ab"}},
       {"*abc*", {"abc", "xabcx", "xxabc", "abcxx", "aabbabc"}, {"", "ab", "acb", "a b c"}},
+    });
+}
+
+// The atoms after the last '*' are checked against the end of the line; the head must not overlap them
+TEST(FilterMatch, TailAfterLastStar)
+{
+    checkCases({
+      {"a*a", {"aa", "aba", "aaa"}, {"a", "", "ab"}},  // one 'a' can not be both the head and the tail
+      {"ab*ba", {"abba", "abxba", "ababa"}, {"aba", "ab", "ba", "abab"}},
+      {"*x", {"x", "xx", "abcx"}, {"", "xa", "X"}},
+      {"*x?", {"xa", "axb", "xxx"}, {"x", "ax", "xab"}},
+      {"*[0-9]", {"1", "a1", "12"}, {"", "1a"}},
+      {"a*\\*", {"a*", "ab*", "a**"}, {"a", "a*b"}},  // an escaped '*' at the end is an ordinary character
+      {"a**b", {"ab", "axb"}, {"a", "b", "abx"}},     // "**" is one '*'
+      {"*\r", {"\r", "a\r"}, {"a", "\ra"}},
+      {std::string("*\0", 2), {std::string("\0", 1), std::string("a\0", 2)}, {"a", std::string("\0a", 2)}},
+    });
+}
+
+// The character after '*' is searched for with memchr: the line may lack it, or have it many times
+TEST(FilterMatch, JumpToLiteral)
+{
+    checkCases({
+      {"*x*", {"x", "abxcd", "xxxx"}, {"", "abc", "X"}},
+      {"*ab*", {"ab", "aaab", "abab", "xaxab"}, {"a", "aa", "ba", "axb"}},  // 'a' found, 'b' fails, next 'a'
+      {"*a?c*", {"abc", "aabc", "xaxc"}, {"ac", "abd", "aa"}},
+      {"a*b*c", {"abc", "abbbc", "axbxc"}, {"ac", "acb", "abcb"}},
     });
 }
 
@@ -294,9 +322,10 @@ TEST(FilterMatch, LongLines)
     EXPECT_FALSE(filter.matchesFilter(longLine));
     EXPECT_TRUE(filter.matchesFilter(longLine + "b"));
 
-    // Worst case of backtracking: one '*' before a long literal, every position of the line is compared
-    // with almost the whole mask (O(line length * mask length))
-    const std::string mask = "*" + std::string(MAX_FILTER_LENGTH - 3, 'a') + "b";
+    // Worst case of backtracking: a long literal between two '*', so the tail check does not cut it off;
+    // memchr finds 'a' at every position of the line, and almost the whole mask is compared there
+    // (O(line length * mask length))
+    const std::string mask = "*" + std::string(MAX_FILTER_LENGTH - 4, 'a') + "b*";
     ASSERT_TRUE(filter.parse(mask));
     const std::string line(64 * 1024, 'a');
     EXPECT_FALSE(filter.matchesFilter(line));
@@ -337,6 +366,75 @@ TEST(FilterLiteral, LongestLiteral)
     ASSERT_TRUE(filter.parse("*ERROR*"));
     EXPECT_FALSE(filter.parse("[abc"));
     EXPECT_TRUE(filter.longestLiteral().empty());
+}
+
+// Element of a mask for the reference matcher: '*', or one character accepted by the set
+struct RefAtom {
+    bool star = false;     // '*': any sequence
+    std::string accepted;  // characters a single-character element accepts
+};
+
+// Reference glob matching by dynamic programming: dp[i][j] - the first i atoms match the first j characters.
+// Slow and obviously correct; Filter::matchesFilter() must give the same answer.
+bool refMatch(const std::vector<RefAtom> &atoms, std::string_view line)
+{
+    std::vector<std::vector<char>> dp(atoms.size() + 1, std::vector<char>(line.size() + 1, 0));
+    dp[0][0] = 1;
+    for (std::size_t i = 1; i <= atoms.size(); ++i) {
+        const RefAtom &a = atoms[i - 1];
+        for (std::size_t j = 0; j <= line.size(); ++j) {
+            if (a.star) {
+                dp[i][j] = dp[i - 1][j] || (j > 0 && dp[i][j - 1]);
+            }
+            else {
+                dp[i][j] = j > 0 && dp[i - 1][j - 1] && a.accepted.find(line[j - 1]) != std::string::npos;
+            }
+        }
+    }
+    return dp[atoms.size()][line.size()] != 0;
+}
+
+// Random masks and lines over a tiny alphabet, so that matches, overlaps of the head and the tail and
+// repeated '*' are frequent. Each mask element is given as its text and its reference meaning.
+TEST(FilterMatch, SameAsReference)
+{
+    struct Element {
+        const char *text;  // element in the mask syntax
+        RefAtom atom;      // its meaning for the reference matcher
+    };
+
+    const Element elements[] = {
+      {"a", {false, "a"}},
+      {"b", {false, "b"}},
+      {"?", {false, "ab*"}},
+      {"*", {true, ""}},
+      {"\\*", {false, "*"}},
+      {"[ab]", {false, "ab"}},
+      {"[!a]", {false, "b*"}},
+    };
+    const char lineChars[] = {'a', 'b', '*'};
+
+    std::mt19937 rng(7);
+    Filter filter;
+    for (int m = 0; m < 3000; ++m) {
+        std::string mask;
+        std::vector<RefAtom> atoms;
+        const std::size_t count = 1 + rng() % 7;
+        for (std::size_t k = 0; k < count; ++k) {
+            const Element &e = elements[rng() % std::size(elements)];
+            mask += e.text;
+            atoms.push_back(e.atom);
+        }
+        ASSERT_TRUE(filter.parse(mask)) << mask;
+
+        for (int l = 0; l < 30; ++l) {
+            std::string line(rng() % 11, 'a');
+            for (char &c: line) {
+                c = lineChars[rng() % std::size(lineChars)];
+            }
+            ASSERT_EQ(filter.matchesFilter(line), refMatch(atoms, line)) << "mask " << mask << ", line " << line;
+        }
+    }
 }
 
 }  // namespace

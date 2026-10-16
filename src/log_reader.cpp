@@ -6,31 +6,6 @@
 
 namespace logreader {
 
-namespace {
-
-// Wrappers only where libstdc++ has no fast equivalent: string_view::rfind(char) is a byte loop
-// (memrchr is SIMD, x16 on a 100-byte line), string_view::find(string_view) is memchr of the first
-// char + compare, not memmem. string_view::find(char) already calls memchr, so it is used as is.
-
-// memrchr() for string_view: position of the last byte c in where, npos if there is none
-std::size_t rfindByte(std::string_view where, char c)
-{
-    const void *p = memrchr(where.data(), c, where.size());
-    return (p == nullptr) ? std::string_view::npos
-                          : static_cast<std::size_t>(static_cast<const char *>(p) - where.data());
-}
-
-// memmem() for string_view: position of the first occurrence of the byte sequence what in where,
-// npos if there is none
-std::size_t findSequence(std::string_view where, std::string_view what)
-{
-    const void *p = memmem(where.data(), where.size(), what.data(), what.size());
-    return (p == nullptr) ? std::string_view::npos
-                          : static_cast<std::size_t>(static_cast<const char *>(p) - where.data());
-}
-
-}
-
 LogReader::LogReader(std::unique_ptr<IFilter> filter_, std::size_t maxBlockSize) noexcept
     : blockSize(std::clamp(maxBlockSize, MIN_BLOCK_SIZE, MAX_BLOCK_SIZE))
     , filter{std::move(filter_)}
@@ -83,6 +58,7 @@ void LogReader::resetPosition()
 {
     dataBegin = 0;
     dataEnd = 0;
+    lastNl = std::string_view::npos;
     eof = false;
     truncatedLine = false;
 }
@@ -110,6 +86,8 @@ bool LogReader::readBlock()
     logFile.read(blockBuf.data() + dataEnd, static_cast<std::streamsize>(space));
     const auto bytes = static_cast<std::size_t>(logFile.gcount());
     dataEnd += bytes;
+    // The data of the block change only here: the end of the prefilter window is found once per block
+    lastNl = std::string_view(blockBuf.data(), dataEnd).rfind('\n');
 
     // read() sets failbit together with eofbit on a short read; badbit means an I/O error
     if (logFile.eof() || logFile.bad()) {
@@ -140,7 +118,7 @@ bool LogReader::dropTruncatedRest()
 // The view points into blockBuf and is valid until the next call. Trailing '\r' is removed.
 // A line longer than the block is returned truncated to the block size, the rest of it up to '\n'
 // is dropped on the next call.
-std::optional<std::string_view> LogReader::nextRawLine()
+std::optional<std::string_view> LogReader::nextLine()
 {
     // If line is truncated - read blocks until first `\n`
     if (truncatedLine && !dropTruncatedRest()) {
@@ -184,9 +162,14 @@ std::optional<std::string_view> LogReader::nextRawLine()
 }
 
 // Prefilter: skips the complete lines of the block that do not contain the literal, so they are neither
-// split into lines nor passed to matchesFilter(). One memmem() over the block is many times faster than
-// matching every line. Stops at the start of the first line with the literal, if there is one.
-// The last line of the block without '\n' and the rest of a truncated line are left to nextRawLine().
+// split into lines nor passed to matchesFilter(). One search over the block is many times faster than
+// matching every line. Only standard string_view search is used, so the code is portable (memmem/memrchr
+// are GNU extensions): find() is memchr of the first byte + compare, on logs it was even faster than glibc
+// memmem. rfind() is a byte loop, so the end of the window (the last '\n' of the block) is found once
+// per block in readBlock(), not on every call: with the literal in almost every line the function is
+// called before every line. Only the short rfind() from the hit back to the start of its line is left here.
+// Stops at the start of the first line with the literal, if there is one.
+// The last line of the block without '\n' and the rest of a truncated line are left to nextLine().
 // A line that loses its trailing '\r' still does not contain the literal, so no matching line is skipped.
 void LogReader::skipLinesWithout(std::string_view literal)
 {
@@ -196,19 +179,19 @@ void LogReader::skipLinesWithout(std::string_view literal)
 
     // Window of complete lines: from dataBegin (always the start of a line here) up to the last '\n'
     const std::string_view rest = pending();
-    const std::size_t lastNl = rfindByte(rest, '\n');
-    if (lastNl == std::string_view::npos) {
-        return;
+    if ((lastNl == std::string_view::npos) || (lastNl < dataBegin)) {
+        return;  // no complete line left in the block
     }
 
-    const std::size_t hit = findSequence(rest.substr(0, lastNl), literal);
+    const std::size_t windowEnd = lastNl - dataBegin;  // last '\n' relative to dataBegin
+    const std::size_t hit = rest.substr(0, windowEnd).find(literal);
     if (hit == std::string_view::npos) {
-        dataBegin += lastNl + 1;  // no line of the window can match
+        dataBegin += windowEnd + 1;  // no line of the window can match
         return;
     }
 
     // Move to the start of the line with the literal: right after the previous '\n'
-    if (const std::size_t nl = rfindByte(rest.substr(0, hit), '\n'); nl != std::string_view::npos) {
+    if (const std::size_t nl = rest.substr(0, hit).rfind('\n'); nl != std::string_view::npos) {
         dataBegin += nl + 1;
     }
 }
@@ -245,7 +228,7 @@ bool LogReader::getNextLine(char *buf, std::size_t bufsize) noexcept
             skipLinesWithout(literal);
         }
 
-        const auto line = nextRawLine();
+        const auto line = nextLine();
         if (!line) {
             break;
         }

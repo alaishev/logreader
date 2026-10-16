@@ -36,6 +36,7 @@ using CharSet = std::bitset<256>;
 // '*' has an empty set: it takes any number of characters and is handled by Filter::matchesFilter().
 struct FilterAtom {
     AtomType type = AtomType::LITERAL;
+    char ch = 0;  // the byte of a LITERAL atom: Filter::matchesFilter() searches for it with memchr
     CharSet set;  // bytes the atom accepts
 
     // Add more fields
@@ -60,9 +61,13 @@ public:
 
 private:
     FilterAtom makeLiteral(char ch) const;  // atom of an ordinary character; with ignoreCase a letter gets both cases
+    bool matchesFixed(std::string_view text, std::size_t first) const;  // atoms from first match text one by one
+
+    static constexpr std::size_t NO_STAR = static_cast<std::size_t>(-1);
 
     std::array<FilterAtom, MAX_FILTER_LENGTH> atoms{};
     std::size_t length = 0;  // number of atoms of the current mask, atoms[length..] are unused
+    std::size_t lastStar = NO_STAR;                 // index of the last '*' atom, NO_STAR if the mask has none
     std::array<char, MAX_FILTER_LENGTH> literal{};  // the longest run of ordinary characters of the mask
     std::size_t literalLength = 0;
     bool valid = false;

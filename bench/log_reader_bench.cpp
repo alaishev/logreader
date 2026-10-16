@@ -4,11 +4,11 @@
 #include "log_reader.h"
 
 #include <benchmark/benchmark.h>
-#include <unistd.h>
 
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -43,6 +43,8 @@ void BM_Match(benchmark::State &state)
       "*ERROR*",                      // literal
       "*order 1?????[02468] *",       // '?' and a class
       "*:[0-5][0-9]:*[!0-9] error*",  // several classes and negation
+      "*INFO  order*d",               // literal in every line, fixed tail after the last '*'
+      "2026-10-14 12:1?:*",           // fixed head, trailing '*'
     };
     const char *mask = masks[state.range(0)];
 
@@ -64,7 +66,7 @@ void BM_Match(benchmark::State &state)
     state.SetLabel(mask);
 }
 
-BENCHMARK(BM_Match)->ArgsProduct({{0, 1, 2}, {0, 1}});
+BENCHMARK(BM_Match)->ArgsProduct({{0, 1, 2, 3, 4}, {0, 1}});
 
 // Size of the generated log file: much larger than the biggest block and than the CPU caches
 constexpr std::size_t LOG_FILE_SIZE = 256 * 1024 * 1024;
@@ -75,7 +77,8 @@ class TempLogFile
 {
 public:
     TempLogFile()
-        : path(std::filesystem::temp_directory_path() / ("logreader_bench_" + std::to_string(::getpid()) + ".log"))
+        : path(std::filesystem::temp_directory_path()
+               / ("logreader_bench_" + std::to_string(std::random_device{}()) + ".log"))
     {
         std::ofstream out(path, std::ios::binary);
         std::string chunk;
@@ -109,11 +112,12 @@ const std::string &logFilePath()
 }
 
 // Reading the whole file with different block sizes: arg 0 - block size in bytes, arg 1 - index of the mask.
-// "x*" rejects every line on its first byte, so it measures reading and splitting into lines only.
+// "?" has no literal for the prefilter and rejects every line at once (the lines are longer than one byte),
+// so it measures reading and splitting into lines only.
 void BM_BlockSize(benchmark::State &state)
 {
     static const char *const masks[] = {
-      "x*",       // reading and splitting only
+      "?",        // reading and splitting only
       "*ERROR*",  // typical search: 10% of the lines match
     };
     const char *mask = masks[state.range(1)];
